@@ -5,6 +5,7 @@ use mac_address::get_mac_address;
 use std::{env, fmt::Display};
 use md5::{Md5, Digest};
 use hex::encode;
+use rot13::rot13;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -100,4 +101,18 @@ fn generate_beacon_id() -> String {
     let hash = encode(result);
 
     /* return */ hash
+}
+
+fn encode_message(message: &str, encoding: EncodingStrategy) -> String {
+    let key = 0x42;
+    match encoding {
+        EncodingStrategy::PlainText => message.to_string(),
+        EncodingStrategy::Base64 => base64::encode(message),
+        EncodingStrategy::Rot13 => rot13(message),
+        EncodingStrategy::Xor => xor(message, key),
+    }
+}
+
+fn xor(data: &str, key: u8) -> String {
+    data.chars().map(|c| (c as u8 ^ key) as char).collect::<String>()
 }
