@@ -10,18 +10,19 @@ BeaconatorC2 supports a flexible transport architecture, allowing for TCP, UDP, 
 
 The rust beacon will implement these transports in the following order:
 
-1. HTTP
-2. Raw TCP
+1. Raw TCP - done
+2. HTTP
 3. Raw UDP
 4. SMB
 
-### Encoding strategies
+### Obfuscation strategies
 
-Similarly, BeaconatorC2 supports a flexible encoding strategy, allowing for for Base64, XOR and ROT13 encoding. The rust beacon will support these encoding strategies in the following order:
+The following obfuscation strats are implemented
 
 1. Base64
 2. XOR
 3. ROT13
+4. Plaintext
 
 ### Stable keylogging
 
